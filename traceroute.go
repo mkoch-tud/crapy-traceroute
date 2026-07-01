@@ -138,12 +138,19 @@ type CSVOutput struct {
 	mu     sync.Mutex
 }
 
+type TraceResult struct {
+	Target Target
+	Hops   []Hop
+	Err    error
+}
+
 func main() {
 	var (
 		maxHops             = flag.Int("m", 30, "maximum hops")
 		timeout             = flag.Duration("w", 2*time.Second, "per-hop timeout")
 		reorderWindow       = flag.Duration("reorder", 500*time.Millisecond, "out-of-order print reorder window")
 		sendInterval        = flag.Duration("send-interval", 500*time.Millisecond, "delay between sending probes")
+		parallel            = flag.Int("parallel", 0, "maximum concurrent target traceroutes; 0 traces all targets concurrently")
 		mode                = flag.String("mode", "icmp", "traceroute probe mode: icmp, udp, or tcp")
 		port                = flag.Int("port", 0, "destination port for tcp mode; optional base destination port for udp mode")
 		iface               = flag.String("iface", "", "network interface to send probes on")
@@ -173,13 +180,12 @@ func main() {
 		os.Exit(2)
 	}
 
-	if *identifyTTLRewrites {
+	if *identifyTTLRewrites || *outputFile != "" {
 		*csvMode = true
 	}
 
 	if *csvMode && *outputFile == "" {
-		fmt.Fprintln(os.Stderr, "csv: -output-file is required when -csv or -identify-ttl-rewrites is used")
-		os.Exit(2)
+		*outputFile = defaultCSVOutputPath(time.Now())
 	}
 
 	targets, err := parseTargets(targetInputs)
@@ -214,18 +220,20 @@ func main() {
 		defer csvOut.Close()
 	}
 
-	for i, target := range targets {
-		if i > 0 {
-			fmt.Println()
-		}
+	if *parallel < 0 {
+		fmt.Fprintln(os.Stderr, "parallel: -parallel must be 0 or greater")
+		os.Exit(2)
+	}
 
+	if len(targets) == 1 {
+		target := targets[0]
 		fmt.Printf("traceroute to %s, %d hops max, %s mode\n", target.IP, *maxHops, traceOpts.Mode)
 		printHeader()
 
-		hops, err := runTraceroute(target, *maxHops, *timeout, *sendInterval, *reorderWindow, traceOpts, geo)
+		hops, err := runTraceroute(target, *maxHops, *timeout, *sendInterval, *reorderWindow, traceOpts, geo, true)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "trace %s: %v\n", target.Input, err)
-			continue
+			return
 		}
 
 		if csvOut != nil {
@@ -235,6 +243,49 @@ func main() {
 				}
 			} else {
 				if err := csvOut.WriteHopRows(target.Input, hops); err != nil {
+					fmt.Fprintln(os.Stderr, "csv:", err)
+				}
+			}
+		}
+		return
+	}
+
+	batchProgress := *inputFile != "" && csvOut != nil
+	if batchProgress {
+		if err := runTraceroutesWithProgress(targets, *maxHops, *timeout, *sendInterval, *reorderWindow, traceOpts, geo, *parallel, csvOut, *identifyTTLRewrites); err != nil {
+			fmt.Fprintln(os.Stderr, "parallel:", err)
+			os.Exit(2)
+		}
+		return
+	}
+
+	results, err := runTraceroutes(targets, *maxHops, *timeout, *sendInterval, *reorderWindow, traceOpts, geo, *parallel)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "parallel:", err)
+		os.Exit(2)
+	}
+
+	for i, result := range results {
+		if i > 0 {
+			fmt.Println()
+		}
+
+		fmt.Printf("traceroute to %s, %d hops max, %s mode\n", result.Target.IP, *maxHops, traceOpts.Mode)
+		printHeader()
+		printHops(result.Hops)
+
+		if result.Err != nil {
+			fmt.Fprintf(os.Stderr, "trace %s: %v\n", result.Target.Input, result.Err)
+			continue
+		}
+
+		if csvOut != nil {
+			if *identifyTTLRewrites {
+				if err := csvOut.WriteIdentifyRows(result.Target.Input, result.Hops); err != nil {
+					fmt.Fprintln(os.Stderr, "csv:", err)
+				}
+			} else {
+				if err := csvOut.WriteHopRows(result.Target.Input, result.Hops); err != nil {
 					fmt.Fprintln(os.Stderr, "csv:", err)
 				}
 			}
@@ -359,6 +410,28 @@ func parseTraceOptions(iface string, src string, mode string, port int) (TraceOp
 	return opts, nil
 }
 
+func validateTargetIdentifierSpace(targets []Target, maxHops int, opts TraceOptions) error {
+	switch opts.Mode {
+	case traceModeICMP:
+		if len(targets) > 65535 {
+			return fmt.Errorf("icmp mode supports at most 65535 concurrent targets because ICMP IDs are 16-bit")
+		}
+	case traceModeUDP:
+		if len(targets) > 0 && opts.Port+(len(targets)-1)*maxHops+maxHops-1 > 65535 {
+			return fmt.Errorf("udp -port %d leaves insufficient disjoint destination ports for %d targets and %d hops", opts.Port, len(targets), maxHops)
+		}
+	case traceModeTCP:
+		if len(targets) > 0 && tcpSourceBase+(len(targets)-1)*maxHops+maxHops > 65535 {
+			return fmt.Errorf("tcp mode cannot allocate disjoint source ports for %d targets and %d hops", len(targets), maxHops)
+		}
+	}
+	return nil
+}
+
+func icmpProbeID(targetIndex int) int {
+	return targetIndex + 1
+}
+
 func listenAddress(opts TraceOptions, ipv6Target bool) (string, error) {
 	if opts.SourceIP == nil {
 		if ipv6Target {
@@ -411,7 +484,128 @@ func listenTracePacket(network string, address string, iface string) (net.Packet
 	return c, nil
 }
 
-func runTraceroute(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, reorderWindow time.Duration, opts TraceOptions, geo *GeoLookup) ([]Hop, error) {
+func defaultCSVOutputPath(now time.Time) string {
+	return "traces-" + now.Format("2006-01-02_15-04-05") + ".csv"
+}
+
+func normalizeParallel(targets []Target, maxHops int, opts TraceOptions, parallel int) (int, error) {
+	if err := validateTargetIdentifierSpace(targets, maxHops, opts); err != nil {
+		return 0, err
+	}
+	if parallel < 0 {
+		return 0, fmt.Errorf("-parallel must be 0 or greater")
+	}
+	if parallel == 0 || parallel > len(targets) {
+		parallel = len(targets)
+	}
+	return parallel, nil
+}
+
+func runTraceroutesWithProgress(targets []Target, maxHops int, timeout time.Duration, sendInterval time.Duration, reorderWindow time.Duration, opts TraceOptions, geo *GeoLookup, parallel int, csvOut *CSVOutput, identifyMode bool) error {
+	parallel, err := normalizeParallel(targets, maxHops, opts, parallel)
+	if err != nil {
+		return err
+	}
+
+	type progressEvent struct {
+		Started bool
+		Result  *TraceResult
+	}
+
+	events := make(chan progressEvent, len(targets)*2)
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+
+	for _, target := range targets {
+		wg.Add(1)
+		go func(target Target) {
+			defer wg.Done()
+			sem <- struct{}{}
+			events <- progressEvent{Started: true}
+			defer func() { <-sem }()
+
+			hops, err := runTraceroute(target, maxHops, timeout, sendInterval, reorderWindow, opts, geo, false)
+			events <- progressEvent{Result: &TraceResult{Target: target, Hops: hops, Err: err}}
+		}(target)
+	}
+
+	go func() {
+		wg.Wait()
+		close(events)
+	}()
+
+	done := 0
+	running := 0
+	total := len(targets)
+	printProgress(total, running, done)
+	for event := range events {
+		if event.Started {
+			running++
+			printProgress(total, running, done)
+			continue
+		}
+
+		running--
+		done++
+		result := event.Result
+		if result.Err != nil {
+			fmt.Fprintf(os.Stderr, "\ntrace %s: %v\n", result.Target.Input, result.Err)
+		} else if identifyMode {
+			if err := csvOut.WriteIdentifyRows(result.Target.Input, result.Hops); err != nil {
+				fmt.Fprintf(os.Stderr, "\ncsv: %v\n", err)
+			}
+		} else {
+			if err := csvOut.WriteHopRows(result.Target.Input, result.Hops); err != nil {
+				fmt.Fprintf(os.Stderr, "\ncsv: %v\n", err)
+			}
+		}
+		printProgress(total, running, done)
+	}
+	fmt.Println()
+	return nil
+}
+
+func printProgress(total int, running int, done int) {
+	left := total - done - running
+	if left < 0 {
+		left = 0
+	}
+	width := 30
+	filled := 0
+	if total > 0 {
+		filled = done * width / total
+	}
+	bar := strings.Repeat("=", filled) + strings.Repeat("-", width-filled)
+	fmt.Printf("\r[%s] running: %d done: %d left: %d", bar, running, done, left)
+}
+
+func runTraceroutes(targets []Target, maxHops int, timeout time.Duration, sendInterval time.Duration, reorderWindow time.Duration, opts TraceOptions, geo *GeoLookup, parallel int) ([]TraceResult, error) {
+	parallel, err := normalizeParallel(targets, maxHops, opts, parallel)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]TraceResult, len(targets))
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+
+	for i, target := range targets {
+		wg.Add(1)
+		go func(i int, target Target) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			hops, err := runTraceroute(target, maxHops, timeout, sendInterval, reorderWindow, opts, geo, false)
+			results[i] = TraceResult{Target: target, Hops: hops, Err: err}
+		}(i, target)
+	}
+
+	wg.Wait()
+	return results, nil
+}
+
+func runTraceroute(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, reorderWindow time.Duration, opts TraceOptions, geo *GeoLookup, livePrint bool) ([]Hop, error) {
 	rawCh := make(chan rawHop, maxHops*4)
 	enrichedCh := make(chan Hop, maxHops*4)
 
@@ -419,10 +613,14 @@ func runTraceroute(target Target, maxHops int, timeout time.Duration, sendInterv
 
 	go enrichLoop(rawCh, enrichedCh, &geoWG, geo)
 
-	printDone := make(chan []Hop, 1)
+	collectDone := make(chan []Hop, 1)
 
 	go func() {
-		printDone <- printOrdered(enrichedCh, maxHops, reorderWindow)
+		var emit func(Hop)
+		if livePrint {
+			emit = printHop
+		}
+		collectDone <- collectOrdered(enrichedCh, maxHops, reorderWindow, emit)
 	}()
 
 	var err error
@@ -451,7 +649,7 @@ func runTraceroute(target Target, maxHops int, timeout time.Duration, sendInterv
 	geoWG.Wait()
 	close(enrichedCh)
 
-	hops := <-printDone
+	hops := <-collectDone
 
 	return hops, err
 }
@@ -520,7 +718,7 @@ func traceICMP4(target Target, maxHops int, timeout time.Duration, sendInterval 
 		return fmt.Errorf("enable IPv4 TTL control message: %w", err)
 	}
 
-	id := (os.Getpid() + target.Index) & 0xffff
+	id := icmpProbeID(target.Index)
 	startTimes := make(map[int]time.Time, maxHops)
 
 	var mu sync.Mutex
@@ -769,7 +967,7 @@ func traceICMP6(target Target, maxHops int, timeout time.Duration, sendInterval 
 		return fmt.Errorf("enable IPv6 HopLimit control message: %w", err)
 	}
 
-	id := (os.Getpid() + target.Index) & 0xffff
+	id := icmpProbeID(target.Index)
 	startTimes := make(map[int]time.Time, maxHops)
 
 	var mu sync.Mutex
@@ -1008,8 +1206,9 @@ func traceUDP4(target Target, maxHops int, timeout time.Duration, sendInterval t
 	if err := validateSourceFamily(opts, false); err != nil {
 		return err
 	}
-	if opts.Port+maxHops-1 > 65535 {
-		return fmt.Errorf("udp base -port %d is too high for %d hops", opts.Port, maxHops)
+	basePort, err := udpTargetBasePort(opts, target, maxHops)
+	if err != nil {
+		return err
 	}
 
 	icmpConn, err := listenTracePacket("ip4:icmp", listenAnyAddress(opts, false), opts.Interface)
@@ -1065,9 +1264,9 @@ func traceUDP4(target Target, maxHops int, timeout time.Duration, sendInterval t
 			var ok, isDone bool
 			switch rm.Type {
 			case ipv4.ICMPTypeTimeExceeded:
-				ttl, quotedTTL, ok = matchEmbeddedUDP4(rm.Body, opts.Port)
+				ttl, quotedTTL, ok = matchEmbeddedUDP4(rm.Body, basePort)
 			case ipv4.ICMPTypeDestinationUnreachable:
-				ttl, quotedTTL, ok = matchEmbeddedUDP4(rm.Body, opts.Port)
+				ttl, quotedTTL, ok = matchEmbeddedUDP4(rm.Body, basePort)
 				isDone = ok
 			}
 			if !ok || ttl < 1 || ttl > maxHops {
@@ -1104,7 +1303,7 @@ func traceUDP4(target Target, maxHops int, timeout time.Duration, sendInterval t
 		mu.Lock()
 		startTimes[ttl] = time.Now()
 		mu.Unlock()
-		port := opts.Port + ttl - 1
+		port := basePort + ttl - 1
 		if _, err := udpConn.WriteTo([]byte("go-traceroute-udp4"), &net.UDPAddr{IP: target.IP, Port: port}); err != nil {
 			return err
 		}
@@ -1123,8 +1322,9 @@ func traceUDP6(target Target, maxHops int, timeout time.Duration, sendInterval t
 	if err := validateSourceFamily(opts, true); err != nil {
 		return err
 	}
-	if opts.Port+maxHops-1 > 65535 {
-		return fmt.Errorf("udp base -port %d is too high for %d hops", opts.Port, maxHops)
+	basePort, err := udpTargetBasePort(opts, target, maxHops)
+	if err != nil {
+		return err
 	}
 
 	icmpConn, err := listenTracePacket("ip6:ipv6-icmp", listenAnyAddress(opts, true), opts.Interface)
@@ -1180,9 +1380,9 @@ func traceUDP6(target Target, maxHops int, timeout time.Duration, sendInterval t
 			var ok, isDone bool
 			switch rm.Type {
 			case ipv6.ICMPTypeTimeExceeded:
-				ttl, quotedHopLimit, ok = matchEmbeddedUDP6(rm.Body, opts.Port)
+				ttl, quotedHopLimit, ok = matchEmbeddedUDP6(rm.Body, basePort)
 			case ipv6.ICMPTypeDestinationUnreachable:
-				ttl, quotedHopLimit, ok = matchEmbeddedUDP6(rm.Body, opts.Port)
+				ttl, quotedHopLimit, ok = matchEmbeddedUDP6(rm.Body, basePort)
 				isDone = ok
 			}
 			if !ok || ttl < 1 || ttl > maxHops {
@@ -1219,7 +1419,7 @@ func traceUDP6(target Target, maxHops int, timeout time.Duration, sendInterval t
 		mu.Lock()
 		startTimes[hopLimit] = time.Now()
 		mu.Unlock()
-		port := opts.Port + hopLimit - 1
+		port := basePort + hopLimit - 1
 		if _, err := udpConn.WriteTo([]byte("go-traceroute-udp6"), &net.UDPAddr{IP: target.IP, Port: port}); err != nil {
 			return err
 		}
@@ -1525,6 +1725,14 @@ func listenAnyAddress(opts TraceOptions, ipv6Target bool) string {
 	return opts.SourceIP.String()
 }
 
+func udpTargetBasePort(opts TraceOptions, target Target, maxHops int) (int, error) {
+	basePort := opts.Port + target.Index*maxHops
+	if basePort+maxHops-1 > 65535 {
+		return 0, fmt.Errorf("udp -port %d leaves insufficient disjoint ports for target index %d and %d hops", opts.Port, target.Index, maxHops)
+	}
+	return basePort, nil
+}
+
 func udpListenAddress(opts TraceOptions, ipv6Target bool) string {
 	if opts.SourceIP == nil {
 		if ipv6Target {
@@ -1652,7 +1860,7 @@ func enrichLoop(in <-chan rawHop, out chan<- Hop, wg *sync.WaitGroup, geo *GeoLo
 	}
 }
 
-func printOrdered(in <-chan Hop, maxHops int, reorderWindow time.Duration) []Hop {
+func collectOrdered(in <-chan Hop, maxHops int, reorderWindow time.Duration, emitHop func(Hop)) []Hop {
 	next := 1
 	buffer := make(map[int]Hop)
 	printed := make(map[int]bool)
@@ -1695,7 +1903,9 @@ func printOrdered(in <-chan Hop, maxHops int, reorderWindow time.Duration) []Hop
 	}
 
 	emit := func(h Hop) bool {
-		printHop(h)
+		if emitHop != nil {
+			emitHop(h)
+		}
 		results = append(results, h)
 		printed[h.TTL] = true
 		return h.Done
@@ -1808,6 +2018,12 @@ func printOrdered(in <-chan Hop, maxHops int, reorderWindow time.Duration) []Hop
 				stopTimer()
 			}
 		}
+	}
+}
+
+func printHops(hops []Hop) {
+	for _, h := range hops {
+		printHop(h)
 	}
 }
 

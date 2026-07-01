@@ -35,7 +35,7 @@ If no MMDB path is provided and the default file is not present, the tool skips 
 
 - IPv4 and IPv6 traceroute with ICMP, UDP, and TCP probes
 - Optional outbound interface and source IP selection
-- Multiple targets in one run
+- Multiple targets in one run, traced concurrently by default
 - Target list input from a file with one literal IP address per line
 - CSV output for later analysis
 - Optional ASN, country, and city enrichment from local MMDB files
@@ -63,10 +63,16 @@ Trace with TCP probes to a destination port:
 ./go-traceroute -mode tcp -port 443 8.8.8.8
 ```
 
-Trace multiple targets from a file:
+Trace multiple targets from a file concurrently:
 
 ```sh
 ./go-traceroute -input-file targets.txt
+```
+
+Limit concurrent target traceroutes:
+
+```sh
+./go-traceroute -parallel 4 -input-file targets.txt
 ```
 
 Send probes on a specific interface:
@@ -87,11 +93,21 @@ Write normal CSV output:
 ./go-traceroute -csv -output-file traces.csv -input-file targets.txt
 ```
 
+`-output-file` implies CSV output. If `-csv` or `-identify-ttl-rewrites` is used without `-output-file`, the tool writes to `traces-YYYY-MM-DD_HH-MM-SS.csv`.
+
 Use custom MMDB files:
 
 ```sh
 ./go-traceroute -geo-asn-mmdb ./asn.mmdb -geo-city-mmdb ./location.mmdb 8.8.8.8
 ```
+
+## Parallel Targets
+
+When multiple targets are provided as arguments or through `-input-file`, the tool traces targets concurrently by default. Use `-parallel N` to cap the number of target traceroutes running at the same time; `-parallel 0` means all targets may run concurrently.
+
+Parallel traces use disjoint probe identifiers so target runs do not match each other's replies: ICMP uses unique echo IDs, UDP allocates a separate destination-port range per target, and TCP allocates a separate source port per target and hop. For a single target, hops are printed live as they are received. For multiple targets without input-file CSV output, output is printed in input order after target results are collected, so target blocks do not interleave.
+
+When `-input-file` is used together with CSV output, hop tables are suppressed and a progress line shows running, done, and left traceroutes while results are written to the CSV file.
 
 ## Probe Modes
 
