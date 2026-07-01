@@ -3,8 +3,8 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/csv"
-	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -13,12 +13,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/oschwald/maxminddb-golang"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -100,10 +102,15 @@ type rawHop struct {
 }
 
 type Target struct {
-	Input  string
+	Input string
 	IP    net.IP
 	IPv6  bool
 	Index int
+}
+
+type TraceOptions struct {
+	Interface string
+	SourceIP  net.IP
 }
 
 type GeoLookup struct {
@@ -123,6 +130,8 @@ func main() {
 		timeout             = flag.Duration("w", 2*time.Second, "per-hop timeout")
 		reorderWindow       = flag.Duration("reorder", 500*time.Millisecond, "out-of-order print reorder window")
 		sendInterval        = flag.Duration("send-interval", 500*time.Millisecond, "delay between sending probes")
+		iface               = flag.String("iface", "", "network interface to send probes on")
+		src                 = flag.String("src", "", "source IP address to bind probe sockets to")
 		inputFile           = flag.String("input-file", "", "file containing one literal IPv4/IPv6 address per line")
 		csvMode             = flag.Bool("csv", false, "also write traceroute results to CSV")
 		outputFile          = flag.String("output-file", "", "CSV output file path")
@@ -163,6 +172,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	traceOpts, err := parseTraceOptions(*iface, *src)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "trace options:", err)
+		os.Exit(2)
+	}
+
 	*cityMMDB = autoMMDBPath(*cityMMDB, defaultCityDB, "city/location")
 	*asnMMDB = autoMMDBPath(*asnMMDB, defaultASNDB, "ASN")
 
@@ -191,7 +206,7 @@ func main() {
 		fmt.Printf("traceroute to %s, %d hops max\n", target.IP, *maxHops)
 		printHeader()
 
-		hops, err := runTraceroute(target, *maxHops, *timeout, *sendInterval, *reorderWindow, geo)
+		hops, err := runTraceroute(target, *maxHops, *timeout, *sendInterval, *reorderWindow, traceOpts, geo)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "trace %s: %v\n", target.Input, err)
 			continue
@@ -271,17 +286,85 @@ func parseTargets(inputs []string) ([]Target, error) {
 		}
 
 		targets = append(targets, Target{
-			Input:  input,
-			IP:     ip,
-			IPv6:   isIPv6,
-			Index:  i,
+			Input: input,
+			IP:    ip,
+			IPv6:  isIPv6,
+			Index: i,
 		})
 	}
 
 	return targets, nil
 }
 
-func runTraceroute(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, reorderWindow time.Duration, geo *GeoLookup) ([]Hop, error) {
+func parseTraceOptions(iface string, src string) (TraceOptions, error) {
+	opts := TraceOptions{Interface: strings.TrimSpace(iface)}
+	src = strings.TrimSpace(src)
+	if src == "" {
+		return opts, nil
+	}
+
+	ip, _, err := parseLiteralIP(src)
+	if err != nil {
+		return TraceOptions{}, fmt.Errorf("invalid -src: %w", err)
+	}
+
+	opts.SourceIP = ip
+	return opts, nil
+}
+
+func listenAddress(opts TraceOptions, ipv6Target bool) (string, error) {
+	if opts.SourceIP == nil {
+		if ipv6Target {
+			return "::", nil
+		}
+		return "0.0.0.0", nil
+	}
+
+	if ipv6Target {
+		if opts.SourceIP.To4() != nil {
+			return "", fmt.Errorf("-src %s is IPv4 but target is IPv6", opts.SourceIP)
+		}
+
+		address := opts.SourceIP.String()
+		if opts.Interface != "" {
+			address += "%" + opts.Interface
+		}
+		return address, nil
+	}
+
+	v4 := opts.SourceIP.To4()
+	if v4 == nil {
+		return "", fmt.Errorf("-src %s is IPv6 but target is IPv4", opts.SourceIP)
+	}
+
+	return v4.String(), nil
+}
+
+func listenTracePacket(network string, address string, iface string) (net.PacketConn, error) {
+	lc := net.ListenConfig{}
+	if iface != "" {
+		lc.Control = func(network string, address string, c syscall.RawConn) error {
+			var sockErr error
+			if err := c.Control(func(fd uintptr) {
+				sockErr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, iface)
+			}); err != nil {
+				return err
+			}
+			if sockErr != nil {
+				return fmt.Errorf("bind socket to interface %q: %w", iface, sockErr)
+			}
+			return nil
+		}
+	}
+
+	c, err := lc.ListenPacket(context.Background(), network, address)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func runTraceroute(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, reorderWindow time.Duration, opts TraceOptions, geo *GeoLookup) ([]Hop, error) {
 	rawCh := make(chan rawHop, maxHops*4)
 	enrichedCh := make(chan Hop, maxHops*4)
 
@@ -297,9 +380,9 @@ func runTraceroute(target Target, maxHops int, timeout time.Duration, sendInterv
 
 	var err error
 	if target.IPv6 {
-		err = trace6(target, maxHops, timeout, sendInterval, rawCh)
+		err = trace6(target, maxHops, timeout, sendInterval, opts, rawCh)
 	} else {
-		err = trace4(target, maxHops, timeout, sendInterval, rawCh)
+		err = trace4(target, maxHops, timeout, sendInterval, opts, rawCh)
 	}
 
 	close(rawCh)
@@ -336,6 +419,7 @@ func autoMMDBPath(flagValue, defaultPath, label string) string {
 		return defaultPath
 	}
 
+	fmt.Printf("geo: no %s MMDB flag provided and ./%s not found, skipping %s lookup\n", label, defaultPath, label)
 	return ""
 }
 
@@ -356,17 +440,19 @@ func parseLiteralIP(input string) (net.IP, bool, error) {
 	return nil, false, fmt.Errorf("invalid IP address %q", input)
 }
 
-func trace4(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, out chan<- rawHop) error {
-	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+func trace4(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop) error {
+	address, err := listenAddress(opts, false)
+	if err != nil {
+		return err
+	}
+
+	c, err := listenTracePacket("ip4:icmp", address, opts.Interface)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
 
-	pc := c.IPv4PacketConn()
-	if pc == nil {
-		return errors.New("failed to get IPv4 packet connection")
-	}
+	pc := ipv4.NewPacketConn(c)
 
 	if err := pc.SetControlMessage(ipv4.FlagTTL, true); err != nil {
 		return fmt.Errorf("enable IPv4 TTL control message: %w", err)
@@ -603,17 +689,19 @@ func matchEmbeddedEcho4(body icmp.MessageBody, id int) (ttl int, quotedTTL int, 
 	return echo.Seq, h.TTL, true
 }
 
-func trace6(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, out chan<- rawHop) error {
-	c, err := icmp.ListenPacket("ip6:ipv6-icmp", "::")
+func trace6(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop) error {
+	address, err := listenAddress(opts, true)
+	if err != nil {
+		return err
+	}
+
+	c, err := listenTracePacket("ip6:ipv6-icmp", address, opts.Interface)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
 
-	pc := c.IPv6PacketConn()
-	if pc == nil {
-		return errors.New("failed to get IPv6 packet connection")
-	}
+	pc := ipv6.NewPacketConn(c)
 
 	if err := pc.SetControlMessage(ipv6.FlagHopLimit, true); err != nil {
 		return fmt.Errorf("enable IPv6 HopLimit control message: %w", err)
