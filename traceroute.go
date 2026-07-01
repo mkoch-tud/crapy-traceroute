@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/csv"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -24,6 +25,9 @@ import (
 )
 
 const (
+	defaultUDPPort = 33434
+	tcpSourceBase  = 40000
+
 	colHop        = 4
 	colAddress    = 40
 	colAS         = 8
@@ -108,9 +112,19 @@ type Target struct {
 	Index int
 }
 
+type TraceMode string
+
+const (
+	traceModeICMP TraceMode = "icmp"
+	traceModeUDP  TraceMode = "udp"
+	traceModeTCP  TraceMode = "tcp"
+)
+
 type TraceOptions struct {
 	Interface string
 	SourceIP  net.IP
+	Mode      TraceMode
+	Port      int
 }
 
 type GeoLookup struct {
@@ -130,6 +144,8 @@ func main() {
 		timeout             = flag.Duration("w", 2*time.Second, "per-hop timeout")
 		reorderWindow       = flag.Duration("reorder", 500*time.Millisecond, "out-of-order print reorder window")
 		sendInterval        = flag.Duration("send-interval", 500*time.Millisecond, "delay between sending probes")
+		mode                = flag.String("mode", "icmp", "traceroute probe mode: icmp, udp, or tcp")
+		port                = flag.Int("port", 0, "destination port for tcp mode; optional base destination port for udp mode")
 		iface               = flag.String("iface", "", "network interface to send probes on")
 		src                 = flag.String("src", "", "source IP address to bind probe sockets to")
 		inputFile           = flag.String("input-file", "", "file containing one literal IPv4/IPv6 address per line")
@@ -172,7 +188,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	traceOpts, err := parseTraceOptions(*iface, *src)
+	traceOpts, err := parseTraceOptions(*iface, *src, *mode, *port)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "trace options:", err)
 		os.Exit(2)
@@ -203,7 +219,7 @@ func main() {
 			fmt.Println()
 		}
 
-		fmt.Printf("traceroute to %s, %d hops max\n", target.IP, *maxHops)
+		fmt.Printf("traceroute to %s, %d hops max, %s mode\n", target.IP, *maxHops, traceOpts.Mode)
 		printHeader()
 
 		hops, err := runTraceroute(target, *maxHops, *timeout, *sendInterval, *reorderWindow, traceOpts, geo)
@@ -296,8 +312,39 @@ func parseTargets(inputs []string) ([]Target, error) {
 	return targets, nil
 }
 
-func parseTraceOptions(iface string, src string) (TraceOptions, error) {
-	opts := TraceOptions{Interface: strings.TrimSpace(iface)}
+func parseTraceOptions(iface string, src string, mode string, port int) (TraceOptions, error) {
+	opts := TraceOptions{
+		Interface: strings.TrimSpace(iface),
+		Mode:      TraceMode(strings.ToLower(strings.TrimSpace(mode))),
+	}
+	if opts.Mode == "" {
+		opts.Mode = traceModeICMP
+	}
+
+	switch opts.Mode {
+	case traceModeICMP:
+		if port != 0 {
+			return TraceOptions{}, fmt.Errorf("-port is only valid with -mode udp or -mode tcp")
+		}
+	case traceModeUDP:
+		if port == 0 {
+			port = defaultUDPPort
+		}
+		if port < 1 || port > 65535 {
+			return TraceOptions{}, fmt.Errorf("-port must be between 1 and 65535")
+		}
+	case traceModeTCP:
+		if port == 0 {
+			return TraceOptions{}, fmt.Errorf("-port is required with -mode tcp")
+		}
+		if port < 1 || port > 65535 {
+			return TraceOptions{}, fmt.Errorf("-port must be between 1 and 65535")
+		}
+	default:
+		return TraceOptions{}, fmt.Errorf("unsupported -mode %q; use icmp, udp, or tcp", mode)
+	}
+	opts.Port = port
+
 	src = strings.TrimSpace(src)
 	if src == "" {
 		return opts, nil
@@ -379,10 +426,25 @@ func runTraceroute(target Target, maxHops int, timeout time.Duration, sendInterv
 	}()
 
 	var err error
-	if target.IPv6 {
-		err = trace6(target, maxHops, timeout, sendInterval, opts, rawCh)
-	} else {
-		err = trace4(target, maxHops, timeout, sendInterval, opts, rawCh)
+	switch opts.Mode {
+	case traceModeICMP:
+		if target.IPv6 {
+			err = traceICMP6(target, maxHops, timeout, sendInterval, opts, rawCh)
+		} else {
+			err = traceICMP4(target, maxHops, timeout, sendInterval, opts, rawCh)
+		}
+	case traceModeUDP:
+		if target.IPv6 {
+			err = traceUDP6(target, maxHops, timeout, sendInterval, opts, rawCh)
+		} else {
+			err = traceUDP4(target, maxHops, timeout, sendInterval, opts, rawCh)
+		}
+	case traceModeTCP:
+		if target.IPv6 {
+			err = traceTCP6(target, maxHops, timeout, sendInterval, opts, rawCh)
+		} else {
+			err = traceTCP4(target, maxHops, timeout, sendInterval, opts, rawCh)
+		}
 	}
 
 	close(rawCh)
@@ -440,7 +502,7 @@ func parseLiteralIP(input string) (net.IP, bool, error) {
 	return nil, false, fmt.Errorf("invalid IP address %q", input)
 }
 
-func trace4(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop) error {
+func traceICMP4(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop) error {
 	address, err := listenAddress(opts, false)
 	if err != nil {
 		return err
@@ -689,7 +751,7 @@ func matchEmbeddedEcho4(body icmp.MessageBody, id int) (ttl int, quotedTTL int, 
 	return echo.Seq, h.TTL, true
 }
 
-func trace6(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop) error {
+func traceICMP6(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop) error {
 	address, err := listenAddress(opts, true)
 	if err != nil {
 		return err
@@ -940,6 +1002,622 @@ func matchEmbeddedEcho6(body icmp.MessageBody, id int) (ttl int, quotedHopLimit 
 	}
 
 	return echo.Seq, h.HopLimit, true
+}
+
+func traceUDP4(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop) error {
+	if err := validateSourceFamily(opts, false); err != nil {
+		return err
+	}
+	if opts.Port+maxHops-1 > 65535 {
+		return fmt.Errorf("udp base -port %d is too high for %d hops", opts.Port, maxHops)
+	}
+
+	icmpConn, err := listenTracePacket("ip4:icmp", listenAnyAddress(opts, false), opts.Interface)
+	if err != nil {
+		return err
+	}
+	defer icmpConn.Close()
+	icmpPC := ipv4.NewPacketConn(icmpConn)
+	if err := icmpPC.SetControlMessage(ipv4.FlagTTL, true); err != nil {
+		return fmt.Errorf("enable IPv4 TTL control message: %w", err)
+	}
+
+	udpConn, err := listenTracePacket("udp4", udpListenAddress(opts, false), opts.Interface)
+	if err != nil {
+		return err
+	}
+	defer udpConn.Close()
+	udpPC := ipv4.NewPacketConn(udpConn)
+
+	startTimes := make(map[int]time.Time, maxHops)
+	var mu sync.Mutex
+	seen := make(map[int]bool, maxHops)
+	done := make(chan struct{})
+	var closeDoneOnce sync.Once
+	closeDone := func() { closeDoneOnce.Do(func() { close(done) }) }
+	var wg sync.WaitGroup
+	defer func() { closeDone(); wg.Wait() }()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 1500)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = icmpPC.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, cm, peer, err := icmpPC.ReadFrom(buf)
+			if err != nil {
+				continue
+			}
+			returnedTTL, hasReturnedTTL := 0, false
+			if cm != nil && cm.TTL > 0 {
+				returnedTTL, hasReturnedTTL = cm.TTL, true
+			}
+			rm, err := icmp.ParseMessage(1, buf[:n])
+			if err != nil {
+				continue
+			}
+			var ttl, quotedTTL int
+			var ok, isDone bool
+			switch rm.Type {
+			case ipv4.ICMPTypeTimeExceeded:
+				ttl, quotedTTL, ok = matchEmbeddedUDP4(rm.Body, opts.Port)
+			case ipv4.ICMPTypeDestinationUnreachable:
+				ttl, quotedTTL, ok = matchEmbeddedUDP4(rm.Body, opts.Port)
+				isDone = ok
+			}
+			if !ok || ttl < 1 || ttl > maxHops {
+				continue
+			}
+			mu.Lock()
+			if seen[ttl] {
+				mu.Unlock()
+				continue
+			}
+			seen[ttl] = true
+			start := startTimes[ttl]
+			mu.Unlock()
+			if start.IsZero() {
+				continue
+			}
+			out <- rawHop{Target: target.Input, TTL: ttl, Addr: peer.String(), RTT: time.Since(start), Done: isDone, ReturnedHopLimit: returnedTTL, HasReturnedHopLimit: hasReturnedTTL, QuotedHopLimit: quotedTTL, HasQuotedHopLimit: true}
+			if isDone {
+				closeDone()
+				return
+			}
+		}
+	}()
+
+	for ttl := 1; ttl <= maxHops; ttl++ {
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		if err := udpPC.SetTTL(ttl); err != nil {
+			return err
+		}
+		mu.Lock()
+		startTimes[ttl] = time.Now()
+		mu.Unlock()
+		port := opts.Port + ttl - 1
+		if _, err := udpConn.WriteTo([]byte("go-traceroute-udp4"), &net.UDPAddr{IP: target.IP, Port: port}); err != nil {
+			return err
+		}
+		startTimeout(&wg, &mu, seen, done, out, target.Input, ttl, timeout)
+		select {
+		case <-done:
+			return nil
+		case <-time.After(sendInterval):
+		}
+	}
+	waitForDone(done, timeout)
+	return nil
+}
+
+func traceUDP6(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop) error {
+	if err := validateSourceFamily(opts, true); err != nil {
+		return err
+	}
+	if opts.Port+maxHops-1 > 65535 {
+		return fmt.Errorf("udp base -port %d is too high for %d hops", opts.Port, maxHops)
+	}
+
+	icmpConn, err := listenTracePacket("ip6:ipv6-icmp", listenAnyAddress(opts, true), opts.Interface)
+	if err != nil {
+		return err
+	}
+	defer icmpConn.Close()
+	icmpPC := ipv6.NewPacketConn(icmpConn)
+	if err := icmpPC.SetControlMessage(ipv6.FlagHopLimit, true); err != nil {
+		return fmt.Errorf("enable IPv6 HopLimit control message: %w", err)
+	}
+
+	udpConn, err := listenTracePacket("udp6", udpListenAddress(opts, true), opts.Interface)
+	if err != nil {
+		return err
+	}
+	defer udpConn.Close()
+	udpPC := ipv6.NewPacketConn(udpConn)
+
+	startTimes := make(map[int]time.Time, maxHops)
+	var mu sync.Mutex
+	seen := make(map[int]bool, maxHops)
+	done := make(chan struct{})
+	var closeDoneOnce sync.Once
+	closeDone := func() { closeDoneOnce.Do(func() { close(done) }) }
+	var wg sync.WaitGroup
+	defer func() { closeDone(); wg.Wait() }()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 1500)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = icmpPC.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, cm, peer, err := icmpPC.ReadFrom(buf)
+			if err != nil {
+				continue
+			}
+			returnedHopLimit, hasReturnedHopLimit := 0, false
+			if cm != nil && cm.HopLimit > 0 {
+				returnedHopLimit, hasReturnedHopLimit = cm.HopLimit, true
+			}
+			rm, err := icmp.ParseMessage(58, buf[:n])
+			if err != nil {
+				continue
+			}
+			var ttl, quotedHopLimit int
+			var ok, isDone bool
+			switch rm.Type {
+			case ipv6.ICMPTypeTimeExceeded:
+				ttl, quotedHopLimit, ok = matchEmbeddedUDP6(rm.Body, opts.Port)
+			case ipv6.ICMPTypeDestinationUnreachable:
+				ttl, quotedHopLimit, ok = matchEmbeddedUDP6(rm.Body, opts.Port)
+				isDone = ok
+			}
+			if !ok || ttl < 1 || ttl > maxHops {
+				continue
+			}
+			mu.Lock()
+			if seen[ttl] {
+				mu.Unlock()
+				continue
+			}
+			seen[ttl] = true
+			start := startTimes[ttl]
+			mu.Unlock()
+			if start.IsZero() {
+				continue
+			}
+			out <- rawHop{Target: target.Input, TTL: ttl, Addr: peer.String(), RTT: time.Since(start), Done: isDone, ReturnedHopLimit: returnedHopLimit, HasReturnedHopLimit: hasReturnedHopLimit, QuotedHopLimit: quotedHopLimit, HasQuotedHopLimit: true}
+			if isDone {
+				closeDone()
+				return
+			}
+		}
+	}()
+
+	for hopLimit := 1; hopLimit <= maxHops; hopLimit++ {
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		if err := udpPC.SetHopLimit(hopLimit); err != nil {
+			return err
+		}
+		mu.Lock()
+		startTimes[hopLimit] = time.Now()
+		mu.Unlock()
+		port := opts.Port + hopLimit - 1
+		if _, err := udpConn.WriteTo([]byte("go-traceroute-udp6"), &net.UDPAddr{IP: target.IP, Port: port}); err != nil {
+			return err
+		}
+		startTimeout(&wg, &mu, seen, done, out, target.Input, hopLimit, timeout)
+		select {
+		case <-done:
+			return nil
+		case <-time.After(sendInterval):
+		}
+	}
+	waitForDone(done, timeout)
+	return nil
+}
+
+func traceTCP4(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop) error {
+	return traceTCP(target, maxHops, timeout, sendInterval, opts, out, false)
+}
+
+func traceTCP6(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop) error {
+	return traceTCP(target, maxHops, timeout, sendInterval, opts, out, true)
+}
+
+func traceTCP(target Target, maxHops int, timeout time.Duration, sendInterval time.Duration, opts TraceOptions, out chan<- rawHop, ipv6Target bool) error {
+	if err := validateSourceFamily(opts, ipv6Target); err != nil {
+		return err
+	}
+	if tcpSourceBase+target.Index*maxHops+maxHops > 65535 {
+		return fmt.Errorf("too many targets/hops for tcp source-port encoding")
+	}
+
+	network := "ip4:icmp"
+	if ipv6Target {
+		network = "ip6:ipv6-icmp"
+	}
+	icmpConn, err := listenTracePacket(network, listenAnyAddress(opts, ipv6Target), opts.Interface)
+	if err != nil {
+		return err
+	}
+	defer icmpConn.Close()
+
+	startTimes := make(map[int]time.Time, maxHops)
+	var mu sync.Mutex
+	seen := make(map[int]bool, maxHops)
+	done := make(chan struct{})
+	var closeDoneOnce sync.Once
+	closeDone := func() { closeDoneOnce.Do(func() { close(done) }) }
+	var wg sync.WaitGroup
+	defer func() { closeDone(); wg.Wait() }()
+
+	if ipv6Target {
+		pc := ipv6.NewPacketConn(icmpConn)
+		if err := pc.SetControlMessage(ipv6.FlagHopLimit, true); err != nil {
+			return fmt.Errorf("enable IPv6 HopLimit control message: %w", err)
+		}
+		wg.Add(1)
+		go readTCPICMP6(pc, target, maxHops, opts, startTimes, &mu, seen, done, closeDone, out, &wg)
+	} else {
+		pc := ipv4.NewPacketConn(icmpConn)
+		if err := pc.SetControlMessage(ipv4.FlagTTL, true); err != nil {
+			return fmt.Errorf("enable IPv4 TTL control message: %w", err)
+		}
+		wg.Add(1)
+		go readTCPICMP4(pc, target, maxHops, opts, startTimes, &mu, seen, done, closeDone, out, &wg)
+	}
+
+	for ttl := 1; ttl <= maxHops; ttl++ {
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		mu.Lock()
+		startTimes[ttl] = time.Now()
+		mu.Unlock()
+		sourcePort := tcpSourcePort(target.Index, maxHops, ttl)
+		wg.Add(1)
+		go dialTCPProbe(&wg, &mu, seen, done, closeDone, out, target, ttl, sourcePort, timeout, opts, ipv6Target)
+		startTimeout(&wg, &mu, seen, done, out, target.Input, ttl, timeout)
+		select {
+		case <-done:
+			return nil
+		case <-time.After(sendInterval):
+		}
+	}
+	waitForDone(done, timeout)
+	return nil
+}
+
+func readTCPICMP4(pc *ipv4.PacketConn, target Target, maxHops int, opts TraceOptions, startTimes map[int]time.Time, mu *sync.Mutex, seen map[int]bool, done <-chan struct{}, closeDone func(), out chan<- rawHop, wg *sync.WaitGroup) {
+	defer wg.Done()
+	buf := make([]byte, 1500)
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		_ = pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, cm, peer, err := pc.ReadFrom(buf)
+		if err != nil {
+			continue
+		}
+		returnedTTL, hasReturnedTTL := 0, false
+		if cm != nil && cm.TTL > 0 {
+			returnedTTL, hasReturnedTTL = cm.TTL, true
+		}
+		rm, err := icmp.ParseMessage(1, buf[:n])
+		if err != nil {
+			continue
+		}
+		var ttl, quotedTTL int
+		var ok, isDone bool
+		switch rm.Type {
+		case ipv4.ICMPTypeTimeExceeded:
+			ttl, quotedTTL, ok = matchEmbeddedTCP4(rm.Body, target.Index, maxHops)
+		case ipv4.ICMPTypeDestinationUnreachable:
+			ttl, quotedTTL, ok = matchEmbeddedTCP4(rm.Body, target.Index, maxHops)
+			isDone = ok
+		}
+		if !ok || ttl < 1 || ttl > maxHops {
+			continue
+		}
+		emitSeenHop(mu, seen, startTimes, out, rawHop{Target: target.Input, TTL: ttl, Addr: peer.String(), RTT: 0, Done: isDone, ReturnedHopLimit: returnedTTL, HasReturnedHopLimit: hasReturnedTTL, QuotedHopLimit: quotedTTL, HasQuotedHopLimit: true})
+		if isDone {
+			closeDone()
+			return
+		}
+	}
+}
+
+func readTCPICMP6(pc *ipv6.PacketConn, target Target, maxHops int, opts TraceOptions, startTimes map[int]time.Time, mu *sync.Mutex, seen map[int]bool, done <-chan struct{}, closeDone func(), out chan<- rawHop, wg *sync.WaitGroup) {
+	defer wg.Done()
+	buf := make([]byte, 1500)
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		_ = pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, cm, peer, err := pc.ReadFrom(buf)
+		if err != nil {
+			continue
+		}
+		returnedHopLimit, hasReturnedHopLimit := 0, false
+		if cm != nil && cm.HopLimit > 0 {
+			returnedHopLimit, hasReturnedHopLimit = cm.HopLimit, true
+		}
+		rm, err := icmp.ParseMessage(58, buf[:n])
+		if err != nil {
+			continue
+		}
+		var ttl, quotedHopLimit int
+		var ok, isDone bool
+		switch rm.Type {
+		case ipv6.ICMPTypeTimeExceeded:
+			ttl, quotedHopLimit, ok = matchEmbeddedTCP6(rm.Body, target.Index, maxHops)
+		case ipv6.ICMPTypeDestinationUnreachable:
+			ttl, quotedHopLimit, ok = matchEmbeddedTCP6(rm.Body, target.Index, maxHops)
+			isDone = ok
+		}
+		if !ok || ttl < 1 || ttl > maxHops {
+			continue
+		}
+		emitSeenHop(mu, seen, startTimes, out, rawHop{Target: target.Input, TTL: ttl, Addr: peer.String(), RTT: 0, Done: isDone, ReturnedHopLimit: returnedHopLimit, HasReturnedHopLimit: hasReturnedHopLimit, QuotedHopLimit: quotedHopLimit, HasQuotedHopLimit: true})
+		if isDone {
+			closeDone()
+			return
+		}
+	}
+}
+
+func dialTCPProbe(wg *sync.WaitGroup, mu *sync.Mutex, seen map[int]bool, done <-chan struct{}, closeDone func(), out chan<- rawHop, target Target, ttl int, sourcePort int, timeout time.Duration, opts TraceOptions, ipv6Target bool) {
+	defer wg.Done()
+
+	network := "tcp4"
+	if ipv6Target {
+		network = "tcp6"
+	}
+	local := &net.TCPAddr{IP: opts.SourceIP, Port: sourcePort}
+	if ipv6Target && opts.Interface != "" {
+		local.Zone = opts.Interface
+	}
+	dialer := net.Dialer{
+		Timeout:   timeout,
+		LocalAddr: local,
+		Control:   tcpControl(opts.Interface, ttl, ipv6Target),
+	}
+	start := time.Now()
+	conn, err := dialer.Dial(network, net.JoinHostPort(target.IP.String(), strconv.Itoa(opts.Port)))
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if err == nil || errors.Is(err, syscall.ECONNREFUSED) {
+		mu.Lock()
+		if seen[ttl] {
+			mu.Unlock()
+			return
+		}
+		seen[ttl] = true
+		mu.Unlock()
+		out <- rawHop{Target: target.Input, TTL: ttl, Addr: target.IP.String(), RTT: time.Since(start), Done: true}
+		closeDone()
+	}
+}
+
+func tcpControl(iface string, ttl int, ipv6Target bool) func(string, string, syscall.RawConn) error {
+	return func(network string, address string, c syscall.RawConn) error {
+		var sockErr error
+		if err := c.Control(func(fd uintptr) {
+			if iface != "" {
+				if err := unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, iface); err != nil {
+					sockErr = err
+					return
+				}
+			}
+			if ipv6Target {
+				sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_UNICAST_HOPS, ttl)
+			} else {
+				sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TTL, ttl)
+			}
+		}); err != nil {
+			return err
+		}
+		if sockErr != nil {
+			return fmt.Errorf("configure tcp probe socket: %w", sockErr)
+		}
+		return nil
+	}
+}
+
+func startTimeout(wg *sync.WaitGroup, mu *sync.Mutex, seen map[int]bool, done <-chan struct{}, out chan<- rawHop, target string, ttl int, timeout time.Duration) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			mu.Lock()
+			if seen[ttl] {
+				mu.Unlock()
+				return
+			}
+			seen[ttl] = true
+			mu.Unlock()
+			out <- rawHop{Target: target, TTL: ttl, TimedOut: true}
+		case <-done:
+			return
+		}
+	}()
+}
+
+func emitSeenHop(mu *sync.Mutex, seen map[int]bool, startTimes map[int]time.Time, out chan<- rawHop, hop rawHop) bool {
+	mu.Lock()
+	if seen[hop.TTL] {
+		mu.Unlock()
+		return false
+	}
+	seen[hop.TTL] = true
+	start := startTimes[hop.TTL]
+	mu.Unlock()
+	if start.IsZero() {
+		return false
+	}
+	hop.RTT = time.Since(start)
+	out <- hop
+	return true
+}
+
+func waitForDone(done <-chan struct{}, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-done:
+	}
+}
+
+func validateSourceFamily(opts TraceOptions, ipv6Target bool) error {
+	if opts.SourceIP == nil {
+		return nil
+	}
+	if ipv6Target && opts.SourceIP.To4() != nil {
+		return fmt.Errorf("-src %s is IPv4 but target is IPv6", opts.SourceIP)
+	}
+	if !ipv6Target && opts.SourceIP.To4() == nil {
+		return fmt.Errorf("-src %s is IPv6 but target is IPv4", opts.SourceIP)
+	}
+	return nil
+}
+
+func listenAnyAddress(opts TraceOptions, ipv6Target bool) string {
+	if opts.SourceIP == nil {
+		if ipv6Target {
+			return "::"
+		}
+		return "0.0.0.0"
+	}
+	if ipv6Target && opts.Interface != "" {
+		return opts.SourceIP.String() + "%" + opts.Interface
+	}
+	return opts.SourceIP.String()
+}
+
+func udpListenAddress(opts TraceOptions, ipv6Target bool) string {
+	if opts.SourceIP == nil {
+		if ipv6Target {
+			return "[::]:0"
+		}
+		return "0.0.0.0:0"
+	}
+	host := opts.SourceIP.String()
+	if ipv6Target && opts.Interface != "" {
+		host += "%" + opts.Interface
+	}
+	return net.JoinHostPort(host, "0")
+}
+
+func tcpSourcePort(targetIndex int, maxHops int, ttl int) int {
+	return tcpSourceBase + targetIndex*maxHops + ttl
+}
+
+func ttlFromPort(port int, base int) (int, bool) {
+	ttl := port - base + 1
+	return ttl, ttl > 0
+}
+
+func ttlFromTCPSourcePort(port int, targetIndex int, maxHops int) (int, bool) {
+	ttl := port - tcpSourceBase - targetIndex*maxHops
+	return ttl, ttl > 0 && ttl <= maxHops
+}
+
+func matchEmbeddedUDP4(body icmp.MessageBody, basePort int) (ttl int, quotedTTL int, ok bool) {
+	data := embeddedICMPData(body)
+	if data == nil {
+		return 0, 0, false
+	}
+	h, err := icmp.ParseIPv4Header(data)
+	if err != nil || len(data) < h.Len+8 || h.Protocol != 17 {
+		return 0, 0, false
+	}
+	dstPort := int(data[h.Len+2])<<8 | int(data[h.Len+3])
+	ttl, ok = ttlFromPort(dstPort, basePort)
+	return ttl, h.TTL, ok
+}
+
+func matchEmbeddedUDP6(body icmp.MessageBody, basePort int) (ttl int, quotedHopLimit int, ok bool) {
+	data := embeddedICMPData(body)
+	if len(data) < ipv6.HeaderLen+8 {
+		return 0, 0, false
+	}
+	h, err := ipv6.ParseHeader(data)
+	if err != nil || h.NextHeader != 17 {
+		return 0, 0, false
+	}
+	dstPort := int(data[ipv6.HeaderLen+2])<<8 | int(data[ipv6.HeaderLen+3])
+	ttl, ok = ttlFromPort(dstPort, basePort)
+	return ttl, h.HopLimit, ok
+}
+
+func matchEmbeddedTCP4(body icmp.MessageBody, targetIndex int, maxHops int) (ttl int, quotedTTL int, ok bool) {
+	data := embeddedICMPData(body)
+	if data == nil {
+		return 0, 0, false
+	}
+	h, err := icmp.ParseIPv4Header(data)
+	if err != nil || len(data) < h.Len+20 || h.Protocol != 6 {
+		return 0, 0, false
+	}
+	srcPort := int(data[h.Len])<<8 | int(data[h.Len+1])
+	ttl, ok = ttlFromTCPSourcePort(srcPort, targetIndex, maxHops)
+	return ttl, h.TTL, ok
+}
+
+func matchEmbeddedTCP6(body icmp.MessageBody, targetIndex int, maxHops int) (ttl int, quotedHopLimit int, ok bool) {
+	data := embeddedICMPData(body)
+	if len(data) < ipv6.HeaderLen+20 {
+		return 0, 0, false
+	}
+	h, err := ipv6.ParseHeader(data)
+	if err != nil || h.NextHeader != 6 {
+		return 0, 0, false
+	}
+	srcPort := int(data[ipv6.HeaderLen])<<8 | int(data[ipv6.HeaderLen+1])
+	ttl, ok = ttlFromTCPSourcePort(srcPort, targetIndex, maxHops)
+	return ttl, h.HopLimit, ok
+}
+
+func embeddedICMPData(body icmp.MessageBody) []byte {
+	switch b := body.(type) {
+	case *icmp.TimeExceeded:
+		return b.Data
+	case *icmp.DstUnreach:
+		return b.Data
+	default:
+		return nil
+	}
 }
 
 func enrichLoop(in <-chan rawHop, out chan<- Hop, wg *sync.WaitGroup, geo *GeoLookup) {
