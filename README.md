@@ -13,6 +13,12 @@
 
 ## Setup
 
+Install Go 1.25 or newer first if `go version` reports an older version or Go is missing. The official installer and OS-specific instructions are at <https://go.dev/doc/install>. After installing, open a new shell and verify:
+
+```sh
+go version
+```
+
 Build the tool:
 
 ```sh
